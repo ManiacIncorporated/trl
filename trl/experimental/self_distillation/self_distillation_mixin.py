@@ -69,18 +69,30 @@ class SelfDistillationMixin:
         attention_mask,
         logits_to_keep,
         compute_entropy=False,
+        batch_size=None,
     ):
-        model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask, "use_cache": False}
-        if "logits_to_keep" in self.model_kwarg_keys:
-            model_inputs["logits_to_keep"] = logits_to_keep + 1
-        logits = model(**model_inputs).logits
-        logits = logits[:, :-1, :]
-        logits = logits[:, -logits_to_keep:, :]
-        logits = logits / self.temperature
-        completion_ids = input_ids[:, -logits_to_keep:]
-        selected_logps = selective_log_softmax(logits, completion_ids)
-        entropies = entropy_from_logits(logits) if compute_entropy else None
-        return selected_logps, entropies
+        # Chunk like GRPO to cap memory when the generation batch is large.
+        batch_size = batch_size or input_ids.size(0)
+        all_logps = []
+        all_entropies = []
+        for start in range(0, input_ids.size(0), batch_size):
+            input_ids_batch = input_ids[start : start + batch_size]
+            attention_mask_batch = attention_mask[start : start + batch_size]
+            model_inputs = {"input_ids": input_ids_batch, "attention_mask": attention_mask_batch, "use_cache": False}
+            if "logits_to_keep" in self.model_kwarg_keys:
+                model_inputs["logits_to_keep"] = logits_to_keep + 1
+            logits = model(**model_inputs).logits
+            logits = logits[:, :-1, :]
+            logits = logits[:, -logits_to_keep:, :]
+            logits = logits / self.temperature
+            completion_ids = input_ids_batch[:, -logits_to_keep:]
+            selected_logps = selective_log_softmax(logits, completion_ids)
+            all_logps.append(selected_logps)
+            if compute_entropy:
+                all_entropies.append(entropy_from_logits(logits))
+        logps = torch.cat(all_logps, dim=0)
+        entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
+        return logps, entropies
 
     def _compute_self_distillation_loss(
         self,

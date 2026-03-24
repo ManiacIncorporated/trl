@@ -44,6 +44,7 @@ from transformers import (
 from transformers.trainer_utils import seed_worker
 from transformers.utils import is_datasets_available, is_peft_available
 
+from ...generation.vllm_generation import VLLMGeneration
 from ...models import prepare_deepspeed, prepare_fsdp
 from ...trainer.base_trainer import _BaseTrainer
 from ...trainer.utils import (
@@ -85,8 +86,8 @@ class BaseSelfDistillationTrainer(OnlineRolloutMixin, SelfDistillationMixin, _Ba
     ):
         if train_dataset is None:
             raise ValueError("`train_dataset` is required")
-        if args.use_vllm:
-            raise NotImplementedError("Self-distillation trainers do not support `use_vllm=True` yet.")
+
+        self.use_vllm = args.use_vllm
 
         if isinstance(model, str):
             model_init_kwargs = args.model_init_kwargs or {}
@@ -140,6 +141,10 @@ class BaseSelfDistillationTrainer(OnlineRolloutMixin, SelfDistillationMixin, _Ba
         self.epsilon_high = args.epsilon_high
         self.beta = args.beta
         self.mask_truncated_completions = args.mask_truncated_completions
+        self.pad_to_multiple_of = args.pad_to_multiple_of
+        self.vllm_importance_sampling_correction = args.vllm_importance_sampling_correction
+        self.vllm_importance_sampling_mode = args.vllm_importance_sampling_mode
+        self.vllm_importance_sampling_cap = args.vllm_importance_sampling_cap
         self.chat_template_kwargs = args.chat_template_kwargs or {}
         self._step = 0
         self._buffered_inputs = None
@@ -165,6 +170,7 @@ class BaseSelfDistillationTrainer(OnlineRolloutMixin, SelfDistillationMixin, _Ba
         if args.generation_kwargs is not None:
             generation_kwargs.update(args.generation_kwargs)
         self.generation_config = GenerationConfig(**generation_kwargs)
+        self.generation_kwargs = generation_kwargs
 
         if hasattr(model, "warnings_issued"):
             model.warnings_issued["estimate_tokens"] = True
@@ -239,6 +245,39 @@ class BaseSelfDistillationTrainer(OnlineRolloutMixin, SelfDistillationMixin, _Ba
                     self.reward_funcs[i] = prepare_fsdp(reward_func, self.accelerator)
                 else:
                     self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
+
+        self.vllm_generation = None
+        self._last_loaded_step = -1
+        if self.use_vllm:
+            self.vllm_generation = VLLMGeneration(
+                model=self.model,
+                accelerator=self.accelerator,
+                is_fsdp_enabled=self.is_fsdp_enabled,
+                processing_class=self.processing_class,
+                mode=args.vllm_mode,
+                structured_outputs_regex=args.vllm_structured_outputs_regex,
+                server_base_url=args.vllm_server_base_url,
+                server_host=args.vllm_server_host,
+                server_port=args.vllm_server_port,
+                group_port=args.vllm_group_port,
+                server_timeout=args.vllm_server_timeout,
+                tensor_parallel_size=args.vllm_tensor_parallel_size,
+                gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                max_model_length=args.vllm_max_model_length,
+                max_num_seqs=args.per_device_train_batch_size
+                * args.vllm_tensor_parallel_size
+                * args.steps_per_generation,
+                enable_sleep_mode=args.vllm_enable_sleep_mode,
+                model_impl=args.vllm_model_impl,
+                repetition_penalty=args.repetition_penalty,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                min_p=args.min_p,
+                max_completion_length=args.max_completion_length,
+                logprobs=0,
+                generation_kwargs=args.generation_kwargs,
+            )
 
         if hasattr(self.model, "add_model_tags"):
             self.model.add_model_tags(self._tag_names)

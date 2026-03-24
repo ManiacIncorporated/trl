@@ -156,9 +156,81 @@ class SelfDistillationConfig(_BaseConfig):
         default=None,
         metadata={"help": "Cache implementation used by transformers generation."},
     )
+    pad_to_multiple_of: int | None = field(
+        default=None,
+        metadata={"help": "If set, prompt and completion ids are padded to a multiple of this value (GRPO-aligned)."},
+    )
     use_vllm: bool = field(
         default=False,
         metadata={"help": "Whether to use vLLM for generation."},
+    )
+    vllm_mode: str = field(
+        default="colocate",
+        metadata={
+            "help": "vLLM integration mode when `use_vllm` is True: `'server'` or `'colocate'` (same semantics as GRPO)."
+        },
+    )
+    vllm_model_impl: str = field(
+        default="vllm",
+        metadata={"help": "Model implementation for vLLM: `transformers` or `vllm`."},
+    )
+    vllm_enable_sleep_mode: bool = field(
+        default=False,
+        metadata={"help": "Enable vLLM sleep mode during the optimizer step (colocate)."},
+    )
+    vllm_structured_outputs_regex: str | None = field(
+        default=None,
+        metadata={"help": "Optional regex for vLLM structured outputs."},
+    )
+    vllm_server_base_url: str | None = field(
+        default=None,
+        metadata={"help": "vLLM server base URL when `vllm_mode='server'`."},
+    )
+    vllm_server_host: str = field(
+        default="0.0.0.0",
+        metadata={"help": "vLLM server host when `vllm_mode='server'` (ignored if `vllm_server_base_url` is set)."},
+    )
+    vllm_server_port: int = field(
+        default=8000,
+        metadata={"help": "vLLM server port when `vllm_mode='server'`."},
+    )
+    vllm_server_timeout: float = field(
+        default=240.0,
+        metadata={"help": "Seconds to wait for the vLLM server when `vllm_mode='server'`."},
+    )
+    vllm_group_port: int = field(
+        default=51216,
+        metadata={"help": "Port for weight-update group when `vllm_mode='server'`."},
+    )
+    vllm_gpu_memory_utilization: float = field(
+        default=0.3,
+        metadata={"help": "GPU memory utilization for colocated vLLM."},
+    )
+    vllm_max_model_length: int | None = field(
+        default=None,
+        metadata={"help": "vLLM max model length; inferred from the model when omitted."},
+    )
+    vllm_tensor_parallel_size: int = field(
+        default=1,
+        metadata={"help": "Tensor parallel size for colocated vLLM."},
+    )
+    vllm_importance_sampling_correction: bool = field(
+        default=True,
+        metadata={
+            "help": "When `use_vllm=True`, apply importance sampling to correct for mismatch between vLLM sampling "
+            "logprobs and recomputed training logprobs (same behavior as GRPO)."
+        },
+    )
+    vllm_importance_sampling_mode: str = field(
+        default="sequence_mask",
+        metadata={
+            "help": "How vLLM IS ratios are constrained when `vllm_importance_sampling_correction=True`. Same options "
+            "as GRPO: `token_truncate`, `token_mask`, `sequence_truncate`, `sequence_mask`."
+        },
+    )
+    vllm_importance_sampling_cap: float = field(
+        default=3.0,
+        metadata={"help": "Cap C for vLLM importance sampling (truncate/mask modes)."},
     )
     beta: float = field(
         default=0.0,
@@ -274,6 +346,17 @@ class SelfDistillationConfig(_BaseConfig):
             raise ValueError("diagnostics_warning_interval must be non-negative")
         if self.diagnostics_flat_tolerance < 0:
             raise ValueError("diagnostics_flat_tolerance must be non-negative")
+
+        if self.use_vllm and self.vllm_mode not in ["server", "colocate"]:
+            raise ValueError("vllm_mode must be 'server' or 'colocate'")
+
+        if self.use_vllm and self.vllm_importance_sampling_correction:
+            valid_vllm_is_modes = ("token_truncate", "token_mask", "sequence_truncate", "sequence_mask")
+            if self.vllm_importance_sampling_mode not in valid_vllm_is_modes:
+                raise ValueError(
+                    f"vllm_importance_sampling_mode must be one of {valid_vllm_is_modes}; "
+                    f"got {self.vllm_importance_sampling_mode!r}"
+                )
 
         num_processes = self.world_size
         if self.generation_batch_size is None and self.steps_per_generation is None:

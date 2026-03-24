@@ -30,6 +30,26 @@ from ..self_distillation.teacher_context import TokenizedPromptBatch, extract_la
 from .sdpo_config import SDPOConfig
 
 
+def _deepcopy_student_for_ema_teacher(student_model: nn.Module) -> nn.Module:
+    """Clone ``student_model`` for an EMA teacher without a transient 2× GPU weight copy.
+
+    ``copy.deepcopy`` on CUDA modules allocates cloned tensors on the same device as the source, which can OOM
+    when the student already shares the GPU with colocated vLLM. For the common single-device case, we deepcopy on
+    CPU then move the teacher to the student's device.
+    """
+    devices = {p.device for p in student_model.parameters()}
+    if len(devices) != 1:
+        return copy.deepcopy(student_model)
+    (dev,) = tuple(devices)
+    if dev.type != "cuda":
+        return copy.deepcopy(student_model)
+    student_model.cpu()
+    try:
+        return copy.deepcopy(student_model)
+    finally:
+        student_model.to(dev)
+
+
 class EMATeacherSyncCallback(SyncRefModelCallback):
     """Synchronize an EMA teacher model with the student model on each step."""
 
@@ -292,7 +312,11 @@ class SDPOTrainer(BaseSelfDistillationTrainer):
             # `self.model` may already be accelerator-wrapped after the shared base constructor. Build the EMA
             # teacher from the unwrapped student model first, then prepare it as an auxiliary eval-only module.
             student_model = self.accelerator.unwrap_model(self.model)
-            self.teacher_model = copy.deepcopy(student_model)
+            self.teacher_model = _deepcopy_student_for_ema_teacher(student_model)
+            s0 = next(student_model.parameters())
+            t0 = next(self.teacher_model.parameters())
+            if t0.device != s0.device:
+                self.teacher_model.to(s0.device)
             self.teacher_model.requires_grad_(False)
             self.teacher_model.eval()
             self.teacher_model = self._prepare_auxiliary_model_for_eval(self.teacher_model)

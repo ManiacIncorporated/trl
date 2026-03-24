@@ -17,18 +17,26 @@
 This mixin owns generation, reward scoring, grouped reward normalization, and online policy-loss plumbing. It is paired
 with `BaseSelfDistillationTrainer` for SDPO-style methods and intentionally kept separate from the generic distillation
 loss logic in `self_distillation_mixin.py`.
+
+Text-only: prompt tokenization and the HuggingFace `model.generate` path mirror `GRPOTrainer._tokenize_prompts` /
+`_generate_single_turn` for the non-vLLM branch (no vision / multimodal inputs).
 """
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 from torch import nn
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers.utils import logging
 
 from ...data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
+from ...extras.profiling import profiling_context
 from ...models import unwrap_model_for_generation
+from ...models.utils import disable_gradient_checkpointing
 from ...trainer.base_trainer import _BaseTrainer
-from ...trainer.utils import pad
+from ...trainer.utils import nanmax, nanmin, pad
 
 
 logger = logging.get_logger(__name__)
@@ -43,50 +51,116 @@ class OnlineRolloutMixin:
             for prompt in prompts
         ]
 
+    def _tokenize_prompt_ids_text_only(self, prompts: list) -> list[list[int]]:
+        """Text-only prompt IDs matching GRPO `_tokenize_prompts` (conversational or string batch)."""
+        if is_conversational({"prompt": prompts[0]}):
+            tokenized = self.processing_class.apply_chat_template(
+                conversation=prompts,
+                tools=getattr(self, "tools", None),
+                chat_template=getattr(self, "chat_template", None),
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                padding=True,
+                **self.chat_template_kwargs,
+            )
+            return [
+                [tok for tok, m in zip(ids, mask, strict=True) if m]
+                for ids, mask in zip(tokenized["input_ids"], tokenized["attention_mask"], strict=True)
+            ]
+
+        prompt_ids = self.processing_class(text=prompts)["input_ids"]
+        if prompt_ids and isinstance(prompt_ids[0], int):
+            prompt_ids = [prompt_ids]
+        return prompt_ids
+
     def _build_buffered_batch(self, generation_batch):
         return self._generate_and_score_completions(generation_batch)
 
     def _generate(self, prompts):
-        # Keep the generation path aligned with the reference trainers: generate from left-padded prompts,
-        # then recover completion token spans by trimming prompt tokens and stopping at the first EOS.
-        prompts_text = self._apply_prompt_template(prompts)
-        generate_inputs = self.processing_class(
-            text=prompts_text,
-            return_tensors="pt",
-            padding=True,
-            padding_side="left",
-            max_length=self.max_prompt_length,
-            truncation=True,
-            add_special_tokens=False,
-        )
-        # This path already receives tokenized model inputs. Bypass the buffered trainer hook and use the plain
-        # tensor/device preparation from `_BaseTrainer`.
+        if self.use_vllm:
+            return self._generate_with_vllm(prompts)
+
+        device = self.accelerator.device
+        prompt_ids = self._tokenize_prompt_ids_text_only(prompts)
+        prompt_tensors = [torch.tensor(ids) for ids in prompt_ids]
+        padded_ids = pad(prompt_tensors, padding_value=self.pad_token_id, padding_side="left")
+        attention_mask = pad([torch.ones_like(t) for t in prompt_tensors], padding_value=0, padding_side="left")
+        generate_inputs = {"input_ids": padded_ids, "attention_mask": attention_mask}
         generate_inputs = _BaseTrainer._prepare_inputs(self, generate_inputs)
+
         with (
+            profiling_context(self, "transformers.generate"),
             unwrap_model_for_generation(
                 self.model_wrapped,
                 self.accelerator,
                 gather_deepspeed3_params=self.args.ds3_gather_for_generation,
+                generation_kwargs=self.generation_kwargs,
             ) as unwrapped_model,
             torch.no_grad(),
+            FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
         ):
             prompt_completion_ids = unwrapped_model.generate(
-                **generate_inputs,
-                generation_config=self.generation_config,
-                disable_compile=True,
+                **generate_inputs, generation_config=self.generation_config, disable_compile=True
             )
-        prompt_ids = generate_inputs["input_ids"]
-        prompt_mask = generate_inputs["attention_mask"]
-        prompt_length = prompt_ids.size(1)
+
+        prompt_length = generate_inputs["input_ids"].size(1)
         completion_ids = prompt_completion_ids[:, prompt_length:]
         is_eos = completion_ids == self.eos_token_id
-        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=completion_ids.device)
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-        seq_idx = torch.arange(is_eos.size(1), device=completion_ids.device).expand(is_eos.size(0), -1)
-        completion_mask = (seq_idx <= eos_idx.unsqueeze(1)).int()
-        prompt_ids_list = [p[m].tolist() for p, m in zip(prompt_ids, prompt_mask.bool(), strict=False)]
-        completion_ids_list = [c[m].tolist() for c, m in zip(completion_ids, completion_mask.bool(), strict=False)]
-        return prompt_ids_list, completion_ids_list
+        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+        prompt_ids_tensor = generate_inputs["input_ids"]
+        prompt_mask_tensor = generate_inputs["attention_mask"]
+        prompt_ids_list = [
+            p[m].tolist() for p, m in zip(prompt_ids_tensor, prompt_mask_tensor.bool(), strict=True)
+        ]
+        completion_ids_list = [
+            c[m].tolist() for c, m in zip(completion_ids.cpu(), completion_mask.bool().cpu(), strict=True)
+        ]
+        return prompt_ids_list, completion_ids_list, None
+
+    def _generate_with_vllm(self, prompts):
+        mode = "train" if self.model.training else "eval"
+        num_generations = self.num_generations if mode == "train" else self.num_generations_eval
+
+        prompt_ids = self._tokenize_prompt_ids_text_only(prompts)
+
+        if self.state.global_step != self._last_loaded_step:
+            with profiling_context(self, "sync_weights"):
+                self.vllm_generation.sync_weights()
+            self._last_loaded_step = self.state.global_step
+
+        with torch.no_grad():
+            prompt_ids_out, completion_ids, logprobs_raw, _ = self.vllm_generation.generate(
+                prompts=prompt_ids,
+                images=None,
+                num_generations=num_generations,
+                profiler=profiling_context(self, "vLLM.generate"),
+            )
+
+        prompt_ids_list = [list(p) for p in prompt_ids_out]
+        completion_ids_list = [list(c) for c in completion_ids]
+
+        need_sampling_logps = self.use_vllm and self.vllm_importance_sampling_correction
+        sampling_logprobs_list: list[list[float]] | None = None
+        if need_sampling_logps:
+            if logprobs_raw is None:
+                raise RuntimeError(
+                    "vLLM returned no logprobs but `vllm_importance_sampling_correction=True`. "
+                    "Ensure VLLMGeneration uses `logprobs=0` (default) so sampled-token logprobs are available."
+                )
+            sampling_logprobs_list = []
+            for row, lp_row in zip(completion_ids_list, logprobs_raw, strict=True):
+                lp = [x[0] for x in lp_row]
+                if len(lp) < len(row):
+                    lp = lp + [0.0] * (len(row) - len(lp))
+                elif len(lp) > len(row):
+                    lp = lp[: len(row)]
+                sampling_logprobs_list.append(lp)
+
+        return prompt_ids_list, completion_ids_list, sampling_logprobs_list
 
     def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
         device = self.accelerator.device
@@ -138,16 +212,36 @@ class OnlineRolloutMixin:
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
         prompts = [x["prompt"] for x in inputs]
-        prompt_ids_list, completion_ids_list = self._generate(prompts)
+        prompt_ids_list, completion_ids_list, sampling_logprobs_list = self._generate(prompts)
 
         prompt_ids = [torch.tensor(ids) for ids in prompt_ids_list]
         prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in prompt_ids]
-        prompt_ids = pad(prompt_ids, padding_value=self.pad_token_id, padding_side="left").to(device=device)
-        prompt_mask = pad(prompt_mask, padding_value=0, padding_side="left").to(device=device)
+        ptm = self.pad_to_multiple_of
+        prompt_ids = pad(
+            prompt_ids, padding_value=self.pad_token_id, padding_side="left", pad_to_multiple_of=ptm
+        ).to(device=device)
+        prompt_mask = pad(prompt_mask, padding_value=0, padding_side="left", pad_to_multiple_of=ptm).to(device=device)
         completion_ids = [torch.tensor(ids) for ids in completion_ids_list]
         completion_mask = [torch.ones_like(ids, dtype=torch.long) for ids in completion_ids]
-        completion_ids = pad(completion_ids, padding_value=self.pad_token_id, padding_side="right").to(device=device)
-        completion_mask = pad(completion_mask, padding_value=0, padding_side="right").to(device=device)
+        completion_ids = pad(
+            completion_ids, padding_value=self.pad_token_id, padding_side="right", pad_to_multiple_of=ptm
+        ).to(device=device)
+        completion_mask = pad(
+            completion_mask, padding_value=0, padding_side="right", pad_to_multiple_of=ptm
+        ).to(device=device)
+
+        if sampling_logprobs_list is not None:
+            sampling_per_token_logps = [
+                torch.tensor(logps, dtype=torch.float32, device=device) for logps in sampling_logprobs_list
+            ]
+            sampling_per_token_logps = pad(
+                sampling_per_token_logps,
+                padding_value=0.0,
+                padding_side="right",
+                pad_to_multiple_of=ptm,
+            ).to(device=device)
+        else:
+            sampling_per_token_logps = None
 
         if self.mask_truncated_completions:
             eos_and_pad = [self.eos_token_id, self.pad_token_id]
@@ -157,19 +251,63 @@ class OnlineRolloutMixin:
         prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)
+        batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
-        with torch.no_grad():
+        # No tool-calling loop here (unlike GRPO); `tool_mask` stays None so the mask matches GRPO when tools are off.
+        tool_mask = None
+
+        vllm_importance_sampling_ratio = None
+        sequence_level_is = False
+        with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
             generate_every = self.args.steps_per_generation * self.num_iterations
-            if self.args.gradient_accumulation_steps % generate_every != 0:
+            need_old_for_misaligned = self.args.gradient_accumulation_steps % generate_every != 0
+            need_old_for_vllm_is = self.use_vllm and self.vllm_importance_sampling_correction
+            if need_old_for_misaligned or need_old_for_vllm_is:
                 old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                     self.model,
                     prompt_completion_ids,
                     attention_mask,
                     logits_to_keep,
                     compute_entropy=False,
+                    batch_size=batch_size,
                 )
             else:
                 old_per_token_logps = None
+
+            if self.use_vllm and self.vllm_importance_sampling_correction:
+                if sampling_per_token_logps is None:
+                    raise RuntimeError(
+                        "`sampling_per_token_logps` is required when `use_vllm=True` and "
+                        "`vllm_importance_sampling_correction=True`."
+                    )
+                if old_per_token_logps is None:
+                    raise RuntimeError(
+                        "`old_per_token_logps` missing for vLLM importance sampling; this should not happen."
+                    )
+                mask = completion_mask if tool_mask is None else completion_mask * tool_mask
+                per_token_logps_diff = (old_per_token_logps - sampling_per_token_logps) * mask
+                sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
+                if sequence_level_is:
+                    per_sequence_logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
+                    logps_diff = per_sequence_logps_diff
+                else:
+                    logps_diff = per_token_logps_diff
+
+                vllm_importance_sampling_ratio = torch.exp(logps_diff)
+
+                if self.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
+                    vllm_importance_sampling_ratio = torch.clamp(
+                        vllm_importance_sampling_ratio, max=self.vllm_importance_sampling_cap
+                    )
+                elif self.vllm_importance_sampling_mode in ["sequence_mask", "token_mask"]:
+                    vllm_importance_sampling_ratio = vllm_importance_sampling_ratio.masked_fill(
+                        vllm_importance_sampling_ratio > self.vllm_importance_sampling_cap, value=0.0
+                    )
+                else:
+                    raise ValueError(
+                        f"Unknown vLLM importance sampling level: {self.vllm_importance_sampling_mode}. Possible "
+                        "values are 'token_truncate', 'token_mask', 'sequence_truncate', and 'sequence_mask'."
+                    )
 
         if is_conversational({"prompt": prompts[0]}):
             completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
@@ -220,6 +358,36 @@ class OnlineRolloutMixin:
         self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
         self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
 
+        if self.use_vllm and self.vllm_importance_sampling_correction:
+            delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
+            mask_bool = completion_mask.bool() if tool_mask is None else (completion_mask * tool_mask).bool()
+            delta = delta[mask_bool]
+            mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
+            max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
+            self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
+                self.accelerator.gather(mean_delta).mean().item()
+            )
+            self._metrics[mode]["sampling/sampling_logp_difference/max"].append(
+                self.accelerator.gather(max_delta).max().item()
+            )
+            if vllm_importance_sampling_ratio is not None:
+                if sequence_level_is:
+                    flat_is_ratio = vllm_importance_sampling_ratio.flatten()
+                else:
+                    flat_is_ratio = vllm_importance_sampling_ratio[mask_bool]
+                min_ir = torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                mean_ir = torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                max_ir = torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                self._metrics[mode]["sampling/importance_sampling_ratio/min"].append(
+                    nanmin(self.accelerator.gather(min_ir)).item()
+                )
+                self._metrics[mode]["sampling/importance_sampling_ratio/mean"].append(
+                    self.accelerator.gather(mean_ir).nanmean().item()
+                )
+                self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
+                    nanmax(self.accelerator.gather(max_ir)).item()
+                )
+
         output = {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
@@ -231,6 +399,10 @@ class OnlineRolloutMixin:
         }
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
+        if self.use_vllm and self.vllm_importance_sampling_correction:
+            output["importance_sampling_ratio"] = vllm_importance_sampling_ratio
+        if sampling_per_token_logps is not None:
+            output["sampling_per_token_logps"] = sampling_per_token_logps
 
         self._dispatch_self_distillation_callback(
             "on_self_distillation_batch_prepared",
@@ -342,6 +514,9 @@ class OnlineRolloutMixin:
         coef_1 = torch.exp(log_ratio)
         coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
         per_token_loss = -torch.min(coef_1 * advantages, coef_2 * advantages)
+
+        if self.use_vllm and self.vllm_importance_sampling_correction:
+            per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
 
         loss = self._aggregate_self_distillation_loss(per_token_loss, completion_mask)
 
