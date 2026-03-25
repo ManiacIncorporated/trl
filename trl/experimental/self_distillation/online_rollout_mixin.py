@@ -32,6 +32,11 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers.utils import logging
 
 from ...data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
+from .teacher_context import (
+    PromptTokenizer,
+    encode_rendered_prompt_texts,
+    extract_unpadded_input_ids,
+)
 from ...extras.profiling import profiling_context
 from ...models import unwrap_model_for_generation
 from ...models.utils import disable_gradient_checkpointing
@@ -54,20 +59,16 @@ class OnlineRolloutMixin:
     def _tokenize_prompt_ids_text_only(self, prompts: list) -> list[list[int]]:
         """Text-only prompt IDs matching GRPO `_tokenize_prompts` (conversational or string batch)."""
         if is_conversational({"prompt": prompts[0]}):
-            tokenized = self.processing_class.apply_chat_template(
-                conversation=prompts,
-                tools=getattr(self, "tools", None),
-                chat_template=getattr(self, "chat_template", None),
-                add_generation_prompt=True,
-                tokenize=True,
-                return_dict=True,
-                padding=True,
-                **self.chat_template_kwargs,
+            # Match [`PromptTokenizer`] / teacher forward: render with `maybe_apply_chat_template`, then
+            # `encode_rendered_prompt_texts` (left truncation at `max_prompt_length`).
+            pt = PromptTokenizer(self)
+            prompt_text = pt.apply_prompt_template(prompts)
+            enc = encode_rendered_prompt_texts(
+                self.processing_class,
+                prompt_text,
+                self.max_prompt_length,
             )
-            return [
-                [tok for tok, m in zip(ids, mask, strict=True) if m]
-                for ids, mask in zip(tokenized["input_ids"], tokenized["attention_mask"], strict=True)
-            ]
+            return extract_unpadded_input_ids(enc)
 
         prompt_ids = self.processing_class(text=prompts)["input_ids"]
         if prompt_ids and isinstance(prompt_ids[0], int):

@@ -124,6 +124,10 @@ class BaseSelfDistillationTrainer(OnlineRolloutMixin, SelfDistillationMixin, _Ba
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
+        # Match `max_prompt_length` docs ("truncated from the left") when a tokenizer is passed in.
+        tokenizer.truncation_side = "left"
+        tokenizer.padding_side = "left"
+
         self.pad_token = tokenizer.pad_token
         self.pad_token_id = tokenizer.pad_token_id
         self.eos_token_id = tokenizer.eos_token_id

@@ -18,10 +18,41 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from transformers import BatchEncoding
 
 from ...data_utils import maybe_apply_chat_template
 from ...trainer.base_trainer import _BaseTrainer
 from ...trainer.utils import pad
+
+
+def encode_rendered_prompt_texts(
+    processing_class: Any,
+    prompt_texts: list[str],
+    max_prompt_length: int | None,
+) -> BatchEncoding:
+    """Batch-encode rendered prompt strings with the same truncation rules as the SDPO teacher path.
+
+    Used by [`PromptTokenizer`] and by vLLM rollouts in [`OnlineRolloutMixin`] so prompt limits stay consistent.
+    """
+    kwargs: dict[str, Any] = {
+        "text": prompt_texts,
+        "return_tensors": "pt",
+        "padding": True,
+        "padding_side": "left",
+        "add_special_tokens": False,
+    }
+    if max_prompt_length is not None:
+        kwargs["max_length"] = max_prompt_length
+        kwargs["truncation"] = True
+    return processing_class(**kwargs)
+
+
+def extract_unpadded_input_ids(prompt_inputs: BatchEncoding) -> list[list[int]]:
+    """Strip padding from a left-padded batch encoding (CPU or device tensors)."""
+    return [
+        p[m].tolist()
+        for p, m in zip(prompt_inputs["input_ids"], prompt_inputs["attention_mask"].bool(), strict=False)
+    ]
 
 
 def extract_last_user_text(prompt: list[dict[str, Any]]) -> str:
@@ -63,20 +94,13 @@ class PromptTokenizer:
 
     def tokenize_prompts(self, prompts: list[Any]) -> TokenizedPromptBatch:
         prompt_text = self.apply_prompt_template(prompts)
-        prompt_inputs = self.trainer.processing_class(
-            text=prompt_text,
-            return_tensors="pt",
-            padding=True,
-            padding_side="left",
-            max_length=self.trainer.max_prompt_length,
-            truncation=True,
-            add_special_tokens=False,
+        prompt_inputs = encode_rendered_prompt_texts(
+            self.trainer.processing_class,
+            prompt_text,
+            self.trainer.max_prompt_length,
         )
         prompt_inputs = super(_BaseTrainer, self.trainer)._prepare_inputs(prompt_inputs)
-        prompt_ids = [
-            p[m].tolist()
-            for p, m in zip(prompt_inputs["input_ids"], prompt_inputs["attention_mask"].bool(), strict=False)
-        ]
+        prompt_ids = extract_unpadded_input_ids(prompt_inputs)
         prompt_ids = [torch.tensor(ids, device=self.trainer.accelerator.device) for ids in prompt_ids]
         prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in prompt_ids]
         return TokenizedPromptBatch(
